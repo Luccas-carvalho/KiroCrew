@@ -7,6 +7,7 @@ import getpass
 import json
 import logging
 import math
+import re
 import time
 from collections import Counter
 from datetime import datetime, timedelta
@@ -116,6 +117,91 @@ def _shards_in_window(days: int) -> list[Path]:
         if shard_date >= cutoff_date:
             paths.append(p)
     return paths
+
+
+#: Window (in days) that the spend tab and the sessions table both sum over.
+#: This is the single source of truth: ``cost_breakdown`` defaults to it, and
+#: ``slot_spend`` uses it, so the two surfaces are arithmetically incapable of
+#: reporting different totals for the same session.
+SPEND_WINDOW_DAYS = 7
+
+# Bare dashboard slot key: chat-<seq>-<epoch>. The shard's ``slot`` field uses
+# this shape (without a ``dashboard:`` prefix), while the session manager keys
+# are ``dashboard:chat-<seq>-<epoch>``. Normalization aligns them.
+_BARE_CHAT_SLOT_RE = re.compile(r"^chat-\d+-\d+$")
+
+# ── per-slot spend (shared by the Sessions table and Spend tab) ────────────
+
+_SLOT_SPEND_CACHE: dict[str, dict[str, float]] = {}
+_SLOT_SPEND_CACHE_SIG: tuple[object, ...] = ()
+
+
+def slot_spend(days: int = SPEND_WINDOW_DAYS) -> dict[str, dict[str, float]]:
+    """Per-session spend over the last *days*: ``{session_key: {"credits", "turns"}}``.
+
+    This is the ONE aggregation path that both the Sessions table and the Spend
+    tab's per-conversation view must go through. It uses the same per-row
+    ``ts_epoch`` cutoff as :func:`cost_breakdown`, so a row inside the boundary
+    shard but older than the cutoff is NOT counted; and it normalizes bare
+    dashboard slot keys (``chat-69-1785905004``) to the full session key form
+    (``dashboard:chat-69-1785905004``) so a direct lookup by session key works.
+
+    Cached against shard size + mtime so polling every few seconds does not
+    re-read the window. Safe to call from a thread (the offloaded sampling
+    thread in session_memory).
+    """
+    global _SLOT_SPEND_CACHE, _SLOT_SPEND_CACHE_SIG
+
+    paths = _shards_in_window(days)
+    sig: tuple[object, ...] = tuple(
+        (str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths if p.exists()
+    )
+    if sig == _SLOT_SPEND_CACHE_SIG and _SLOT_SPEND_CACHE_SIG:
+        return _SLOT_SPEND_CACHE
+
+    now = time.time()
+    cutoff = now - (days * 86400)
+    out: dict[str, dict[str, float]] = {}
+
+    for path in paths:
+        try:
+            with path.open() as fh:
+                for line in fh:
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
+                        continue
+                    # Per-row timestamp cutoff: the shard file date is a coarse
+                    # filter (a shard can span midnight), so rows older than the
+                    # cutoff must still be excluded individually.
+                    ts_raw = str(obj.get("ts") or "")
+                    try:
+                        ts_str = (
+                            ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
+                        )
+                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                    if ts_epoch < cutoff:
+                        continue
+                    slot = str(obj.get("slot") or "")
+                    if not slot or not is_session_slot(slot):
+                        continue
+                    credits = obj.get("credits")
+                    if not isinstance(credits, (int, float)) or not math.isfinite(credits):
+                        continue
+                    # Normalize bare dashboard keys to the full session-key form.
+                    key = f"dashboard:{slot}" if _BARE_CHAT_SLOT_RE.match(slot) else slot
+                    cur = out.setdefault(key, {"credits": 0.0, "turns": 0.0})
+                    cur["credits"] += float(credits)
+                    cur["turns"] += 1
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    _SLOT_SPEND_CACHE, _SLOT_SPEND_CACHE_SIG = out, sig
+    return out
 
 
 # A payload backstop, not a top-N: the panel lists sessions for the user to
@@ -461,7 +547,7 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
     }
 
 
-def cost_breakdown(days: int = 7) -> dict[str, Any]:
+def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
     """Aggregate per-turn spend from the token row store into a cost view.
 
     Answers "what did the last *days* cost, compared with the *days* before it,
