@@ -417,6 +417,65 @@ capability check it never had.
   running gateway holds live sessions; the helper is what makes the swap
   survivable.
 
+  **Managed-venv replacement mechanics (invariants, not a settled design).**
+  `cli.sh` has two install branches, and only one of them is pipx. The other —
+  the default when pipx is absent — is a fixed-path managed venv
+  (`${KIROCREW_HOME}-venv`, `cli.sh:331`) upgraded **in place** today. For that
+  shape the promising direction is *versioned trees with atomic promotion*:
+  build `crew-venv-<version>` completely while the old gateway keeps serving,
+  then promote a stable path to point at it, then restart. (Precedent:
+  Claude Code's native installer keeps per-version binaries under
+  `~/.local/share/claude/versions/` behind one symlink; Codex CLI instead
+  detects the owning package manager and delegates.) A cross-vendor
+  adversarial council reviewed a concrete version of this design
+  (2026-08-06, GPT 5.6 / DeepSeek 3.2 / GLM 5 — REVISE / REJECT / REVISE)
+  and reduced it to the following **invariants any Phase 2 implementation
+  must satisfy**, with the mechanism itself left to the implementation PR:
+
+  - **Promotion must be actually atomic.** `ln -sfn` is unlink + create — a
+    missing-path window — and is not atomic on NFS at all. Atomic promotion is
+    a sibling symlink replaced via `rename(2)` / `os.replace`.
+  - **Every persisted launch path must resolve through the stable path.** At
+    least four exist today: `KIROCREW_SERVICE_BIN`, the `kirocrew_bin()` value
+    systemd renders into `ExecStart`, the generated macOS live-gateway
+    launcher, and the non-service restart in `updates.py`, which re-execs
+    `sys.executable` — the old version-specific interpreter. Fixing only the
+    service unit resurrects the old tree on every other path.
+  - **The old-inode guarantee holds only for versioned trees.** A Python
+    process imports lazily; after a flip, not-yet-imported modules resolve from
+    the new tree. "The running gateway is unaffected" is true only once the
+    running gateway was itself started from an immutable versioned directory —
+    which makes the **first migration** (today's real directory becoming a
+    symlink, without breaking the live venv's absolute shebangs) a protocol of
+    its own, not a detail.
+  - **A fresh venv re-resolves the dependency graph.** `setup.cfg` carries wide
+    ranges; a rebuilt environment downloads packages covered by nobody's
+    signature. The install step needs locked, hash-pinned constraints (or a
+    wheelhouse) inside the verified payload, or the provenance story covers
+    only the Kiro Crew wheel itself.
+  - **Provenance must bind more than a digest.** The feed is unsigned; an
+    actor who controls it can point at a *different* artifact with valid
+    provenance from the same repo. Verification must check workflow, commit
+    lineage and channel policy against the client-pinned root — and the SLSA
+    requirement above is unconditional; no "or" fallbacks.
+  - **pipx delegation is not a safety property.** `pipx install --force`
+    mutates the fixed pipx environment in place while the old gateway is using
+    it — the torn-runtime hazard this section exists to avoid. If Phase 2
+    ships a pipx apply path at all, it drains first, accepts the downtime, and
+    documents rollback as unsupported for that shape. Which branch owns a
+    given install is also **not derivable at update time** (pipx presence now
+    proves nothing about install time); the installer must persist the branch
+    it took.
+  - **Rollback stays a non-goal.** Retained old trees are *manual recovery
+    targets*, nothing more; any pruning policy must never delete the tree the
+    running process was started from, and cleanup failures must not fail the
+    update.
+  - **macOS TCC identity across path rotation is an open compatibility test,
+    not a solved problem.** The console script's shebang names the rotating
+    versioned interpreter, so a stable outer symlink may not preserve grants
+    (Claude Code hit exactly this: anthropics/claude-code#76246, #77081,
+    #80899).
+
   The checksum is necessary and not sufficient. `SHA256SUMS` is served from the
   same CDN as the wheel, so an actor who can replace one can replace both —
   `publish-cli.yml:85-87` says this in as many words ("integrity, not
@@ -706,6 +765,18 @@ see §4.
    `unavailable_reason` by §2 but not yet expressed as `check_status`. Unifying
    them is right in principle and may not be worth a Phase 1b churn on a lane
    that currently works.
+7. What consent does the in-app wheel Apply actually require? The button turns
+   an update into a network-reachable code-install trigger for anyone holding a
+   dashboard session token — including sessions arriving through tunnels
+   (Tailscale serve / cloudflared), where the token is the *only* effective
+   gate today. A frontend confirmation dialog does not address that adversary:
+   the SPA is served from the CDN and a compromised SPA can dismiss its own
+   modal. The candidates are (a) declaring the dashboard token sufficient
+   operator authority and saying so explicitly, or (b) a gateway-enforced
+   step-up — e.g. a one-time confirmation code surfaced out-of-band (terminal /
+   loopback only) that the SPA cannot supply for itself. Either way the audit
+   record needs target version, channel, artifact digest, attempt id, request
+   source, and outcome — not just a generic mutating-endpoint log line.
 
 ## Provenance
 
@@ -785,4 +856,21 @@ independently; sources in the session record):
   which walks up to any ancestor repo) is itself an instance of the failure
   these two walk-backs describe, which is why OQ5 requires the equality check
   rather than the exit status alone.
+
+### Managed-venv mechanics review (2026-08-06, same day, second panel)
+
+A second adversarial panel (`gpt-5.6-sol`, `deepseek-3.2`, `glm-5`; a fourth
+member failed twice on an upstream error) red-teamed a concrete
+versioned-venv-plus-symlink-flip design for the wheel shape, drawn from a
+comparison against Claude Code's native installer (per-version binaries behind
+one symlink) and Codex CLI (detect the owning package manager and delegate).
+Verdicts: REVISE / REJECT / REVISE. The direction survived; the specific
+guarantees did not — `ln -sfn` is not atomic, the old-inode claim ignores lazy
+imports, four persisted launch paths exist rather than one, a rebuilt venv
+re-resolves unsigned dependencies, digest-only provenance admits
+artifact-substitution from an unsigned feed, and pipx delegation re-creates the
+in-place torn-runtime hazard. Per the panel's convergent placement finding, the
+outcome enters §3 as **invariants plus a first-migration open problem**, and
+the consent exposure as Open Question 7 — not as a settled mechanism. The
+mechanism itself is Phase 2 implementation-PR territory.
 
