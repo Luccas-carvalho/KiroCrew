@@ -1804,12 +1804,37 @@ class PublishConfig:
 
 
 @dataclass
+class TailscaleConfig:
+    """Tailnet access for the dashboard (RFC: rfc-tailnet-dashboard-access)."""
+
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Tailnet Access",
+            "Accept this machine's own MagicDNS name as a dashboard origin, so "
+            "`tailscale serve` works without hand-writing dashboard.url. Reads "
+            "the local Tailscale daemon once at startup; contributes nothing if "
+            "Tailscale is absent, stopped, or MagicDNS is off. Does NOT widen the "
+            "network bind and does NOT change authentication — every request "
+            "still needs a dashboard session.",
+        ),
+    )
+
+
+@dataclass
 class DashboardConfig:
     url: str = field(
         default="",
         metadata=_meta(
             "Dashboard URL",
             "Public URL for the dashboard (used in Slack links).",
+        ),
+    )
+    tailscale: TailscaleConfig = field(
+        default_factory=TailscaleConfig,
+        metadata=_meta(
+            "Tailscale",
+            "Reach the dashboard over your tailnet via `tailscale serve`.",
         ),
     )
     restore_sessions: bool = field(
